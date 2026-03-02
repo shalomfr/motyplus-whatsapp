@@ -9,6 +9,8 @@ const {
 const { Boom } = require("@hapi/boom");
 const pino = require("pino");
 const QRCode = require("qrcode");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(express.json());
@@ -34,11 +36,39 @@ function authCheck(req, res, next) {
   next();
 }
 
+// Clear stale auth data
+function clearAuthDir() {
+  try {
+    if (fs.existsSync(AUTH_DIR)) {
+      const files = fs.readdirSync(AUTH_DIR);
+      for (const file of files) {
+        fs.unlinkSync(path.join(AUTH_DIR, file));
+      }
+      console.log(`Cleared ${files.length} auth files`);
+    }
+  } catch (e) {
+    console.error("Error clearing auth dir:", e);
+  }
+}
+
+// Track consecutive failed connection attempts
+let failedAttempts = 0;
+const MAX_FAILED_ATTEMPTS = 3;
+
 // Initialize WhatsApp connection
-async function connectWhatsApp() {
+async function connectWhatsApp(forceClean = false) {
+  clearTimeout(reconnectTimer);
+
   if (sock) {
     try { sock.end(undefined); } catch (e) { /* ignore */ }
     sock = null;
+  }
+
+  // If forced clean or too many failed attempts, clear auth
+  if (forceClean || failedAttempts >= MAX_FAILED_ATTEMPTS) {
+    console.log(`Clearing auth (forceClean=${forceClean}, failedAttempts=${failedAttempts})`);
+    clearAuthDir();
+    failedAttempts = 0;
   }
 
   qrBase64 = null;
@@ -49,7 +79,7 @@ async function connectWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
-    console.log(`Connecting with Baileys version ${version.join(".")}...`);
+    console.log(`Connecting with Baileys version ${version.join(".")}... (attempt after ${failedAttempts} failures)`);
 
     sock = makeWASocket({
       version,
@@ -70,6 +100,7 @@ async function connectWhatsApp() {
 
       if (qr) {
         qrString = qr;
+        failedAttempts = 0; // QR generated = connection to WA servers works
         try {
           qrBase64 = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
           console.log("QR code generated!");
@@ -82,6 +113,7 @@ async function connectWhatsApp() {
         connectionStatus = "connected";
         qrBase64 = null;
         qrString = null;
+        failedAttempts = 0;
         phoneNumber = sock.user?.id?.split(":")[0] || sock.user?.id?.split("@")[0] || null;
         console.log(`Connected! Phone: ${phoneNumber}`);
       }
@@ -95,11 +127,15 @@ async function connectWhatsApp() {
         sock = null;
 
         if (shouldReconnect) {
-          console.log("Reconnecting in 5 seconds...");
+          failedAttempts++;
+          const delay = Math.min(5000 * failedAttempts, 30000);
+          console.log(`Reconnecting in ${delay/1000}s... (failed attempts: ${failedAttempts})`);
           clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(connectWhatsApp, 5000);
+          reconnectTimer = setTimeout(() => connectWhatsApp(false), delay);
         } else {
-          console.log("Logged out. Not reconnecting.");
+          console.log("Logged out. Clearing auth and not reconnecting.");
+          clearAuthDir();
+          failedAttempts = 0;
           phoneNumber = null;
         }
       }
@@ -109,9 +145,10 @@ async function connectWhatsApp() {
   } catch (error) {
     console.error("Connection error:", error);
     connectionStatus = "disconnected";
-    // Retry in 10 seconds
+    failedAttempts++;
+    const delay = Math.min(10000 * failedAttempts, 60000);
     clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connectWhatsApp, 10000);
+    reconnectTimer = setTimeout(() => connectWhatsApp(false), delay);
   }
 }
 
@@ -142,10 +179,11 @@ app.post("/connect", authCheck, async (req, res) => {
   if (connectionStatus === "connected") {
     return res.json({ status: "connected", phone: phoneNumber });
   }
-  connectWhatsApp();
+  // Force clean auth on manual connect to ensure fresh QR
+  await connectWhatsApp(true);
   // Wait a bit for QR
   let waited = 0;
-  while (!qrBase64 && connectionStatus !== "connected" && waited < 15000) {
+  while (!qrBase64 && connectionStatus !== "connected" && waited < 20000) {
     await new Promise((r) => setTimeout(r, 500));
     waited += 500;
   }
@@ -153,6 +191,33 @@ app.post("/connect", authCheck, async (req, res) => {
     status: connectionStatus,
     qrcode: qrBase64 || null,
     phone: phoneNumber,
+  });
+});
+
+// Force reset - clear everything and reconnect fresh
+app.post("/reset", authCheck, async (req, res) => {
+  clearTimeout(reconnectTimer);
+  if (sock) {
+    try { sock.end(undefined); } catch (e) { /* ignore */ }
+    sock = null;
+  }
+  connectionStatus = "disconnected";
+  phoneNumber = null;
+  qrBase64 = null;
+  failedAttempts = 0;
+  clearAuthDir();
+  // Now reconnect fresh
+  await connectWhatsApp(false);
+  let waited = 0;
+  while (!qrBase64 && connectionStatus !== "connected" && waited < 20000) {
+    await new Promise((r) => setTimeout(r, 500));
+    waited += 500;
+  }
+  res.json({
+    status: connectionStatus,
+    qrcode: qrBase64 || null,
+    phone: phoneNumber,
+    message: "Auth cleared and reconnected fresh",
   });
 });
 
