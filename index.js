@@ -137,10 +137,10 @@ app.get("/status", authCheck, (req, res) => {
   });
 });
 
-// Connect / reconnect
+// Connect / reconnect (QR mode)
 app.post("/connect", authCheck, async (req, res) => {
   if (connectionStatus === "connected") {
-    return res.json({ status: "already_connected", phone: phoneNumber });
+    return res.json({ status: "connected", phone: phoneNumber });
   }
   connectWhatsApp();
   // Wait a bit for QR
@@ -154,6 +154,93 @@ app.post("/connect", authCheck, async (req, res) => {
     qrcode: qrBase64 || null,
     phone: phoneNumber,
   });
+});
+
+// Connect via pairing code (phone number)
+app.post("/pair", authCheck, async (req, res) => {
+  if (connectionStatus === "connected") {
+    return res.json({ status: "connected", phone: phoneNumber });
+  }
+
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: "phone number required" });
+
+  // Format phone: remove non-digits, ensure 972 prefix
+  let digits = phone.replace(/\D/g, "");
+  if (digits.startsWith("0")) digits = "972" + digits.slice(1);
+  if (!digits.startsWith("972")) digits = "972" + digits;
+
+  // Need a fresh connection for pairing code
+  if (sock) {
+    try { sock.end(undefined); } catch (e) { /* ignore */ }
+    sock = null;
+  }
+  qrBase64 = null;
+  qrString = null;
+  connectionStatus = "connecting";
+
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { version } = await fetchLatestBaileysVersion();
+
+    sock = makeWASocket({
+      version,
+      logger,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      printQRInTerminal: false,
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false,
+      markOnlineOnConnect: true,
+      browser: ["MotyPlus CRM", "Chrome", "1.0.0"],
+    });
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === "open") {
+        connectionStatus = "connected";
+        qrBase64 = null;
+        phoneNumber = sock.user?.id?.split(":")[0] || sock.user?.id?.split("@")[0] || null;
+        console.log(`Connected via pairing! Phone: ${phoneNumber}`);
+      }
+      if (connection === "close") {
+        const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        connectionStatus = "disconnected";
+        sock = null;
+        if (shouldReconnect) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(connectWhatsApp, 5000);
+        }
+      }
+    });
+    sock.ev.on("creds.update", saveCreds);
+
+    // Wait for socket to be ready, then request pairing code
+    let waited = 0;
+    while (!sock.authState?.creds?.registered && connectionStatus === "connecting" && waited < 10000) {
+      await new Promise((r) => setTimeout(r, 500));
+      waited += 500;
+    }
+
+    if (sock.authState?.creds?.registered) {
+      return res.json({ status: connectionStatus, phone: phoneNumber });
+    }
+
+    const code = await sock.requestPairingCode(digits);
+    console.log(`Pairing code for ${digits}: ${code}`);
+
+    res.json({
+      status: "pairing",
+      pairingCode: code,
+      message: `Enter code ${code} in WhatsApp > Linked Devices > Link a Device > Link with phone number`,
+    });
+  } catch (error) {
+    console.error("Pairing error:", error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Disconnect / logout
