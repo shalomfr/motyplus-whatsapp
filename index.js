@@ -25,9 +25,12 @@ const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 let sock = null;
 let qrBase64 = null;
 let qrString = null;
-let connectionStatus = "disconnected"; // disconnected | connecting | connected
+let connectionStatus = "disconnected"; // disconnected | connecting | connected | qr_ready
 let phoneNumber = null;
 let reconnectTimer = null;
+let qrCount = 0; // How many QR codes generated in current session
+let lastQrTime = 0; // Timestamp of last QR generation
+let waitingForScan = false; // True while QR is shown and waiting for user to scan
 
 // Auth middleware
 function authCheck(req, res, next) {
@@ -81,6 +84,9 @@ async function connectWhatsApp(forceClean = false) {
 
     console.log(`Connecting with Baileys version ${version.join(".")}... (attempt after ${failedAttempts} failures)`);
 
+    qrCount = 0;
+    waitingForScan = false;
+
     sock = makeWASocket({
       version,
       logger,
@@ -93,6 +99,7 @@ async function connectWhatsApp(forceClean = false) {
       syncFullHistory: false,
       markOnlineOnConnect: true,
       browser: ["MotyPlus CRM", "Chrome", "1.0.0"],
+      qrTimeout: 60000, // 60 seconds per QR before generating new one
     });
 
     sock.ev.on("connection.update", async (update) => {
@@ -100,10 +107,14 @@ async function connectWhatsApp(forceClean = false) {
 
       if (qr) {
         qrString = qr;
+        qrCount++;
+        lastQrTime = Date.now();
+        waitingForScan = true;
         failedAttempts = 0; // QR generated = connection to WA servers works
+        connectionStatus = "qr_ready";
         try {
           qrBase64 = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
-          console.log("QR code generated!");
+          console.log(`QR code #${qrCount} generated!`);
         } catch (e) {
           console.error("QR generation error:", e);
         }
@@ -114,6 +125,8 @@ async function connectWhatsApp(forceClean = false) {
         qrBase64 = null;
         qrString = null;
         failedAttempts = 0;
+        waitingForScan = false;
+        qrCount = 0;
         phoneNumber = sock.user?.id?.split(":")[0] || sock.user?.id?.split("@")[0] || null;
         console.log(`Connected! Phone: ${phoneNumber}`);
       }
@@ -121,10 +134,22 @@ async function connectWhatsApp(forceClean = false) {
       if (connection === "close") {
         const statusCode = (lastDisconnect?.error)?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`Connection closed. Code: ${statusCode}, Reconnect: ${shouldReconnect}`);
+        const isQrExpired = statusCode === 408 || statusCode === 428;
+        console.log(`Connection closed. Code: ${statusCode}, Reconnect: ${shouldReconnect}, QR expired: ${isQrExpired}`);
+
+        sock = null;
+        waitingForScan = false;
+
+        // If QR expired (user didn't scan), DON'T auto-reconnect — let user click again
+        if (isQrExpired) {
+          console.log("QR expired without scan. Waiting for user to click connect again.");
+          connectionStatus = "disconnected";
+          qrBase64 = null;
+          qrString = null;
+          return;
+        }
 
         connectionStatus = "disconnected";
-        sock = null;
 
         if (shouldReconnect) {
           failedAttempts++;
@@ -171,6 +196,8 @@ app.get("/status", authCheck, (req, res) => {
     status: connectionStatus,
     phone: phoneNumber,
     qrcode: qrBase64 || null,
+    qrCount,
+    qrAge: lastQrTime ? Math.floor((Date.now() - lastQrTime) / 1000) : null,
   });
 });
 
